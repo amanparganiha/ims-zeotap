@@ -1,0 +1,26 @@
+# Web framework
+fastapi==0.115.5
+uvicorn[standard]==0.32.1
+
+# Async DB drivers
+asyncpg==0.30.0
+sqlalchemy[asyncio]==2.0.36
+motor==3.6.0          # async MongoDB
+
+# Redis
+redis[hiredis]==5.2.0
+
+# Validation & settings
+pydantic==2.10.3
+pydantic-settings==2.6.1
+
+# Utilities
+python-multipart==0.0.12
+python-jose[cryptography]==3.3.0
+slowapi==0.1.9         # rate limiting
+prometheus-client==0.21.0
+
+# Testing
+pytest==8.3.4
+pytest-asyncio==0.24.0
+httpx==0.28.1
