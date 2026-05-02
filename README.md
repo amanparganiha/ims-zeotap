@@ -1,7 +1,7 @@
 # Incident Management System (IMS)
 
 > **Zeotap Infrastructure / SRE Intern Assignment**
-> Submitted by: Aman
+> Submitted by: Aman Parganiha
 
 **GitHub:** `<!-- ADD YOUR GITHUB LINK HERE -->`
 
@@ -12,20 +12,20 @@
 ```
 ┌─────────────────────────────────────────────────────────────────────┐
 │                         PRODUCERS                                   │
-│         (APIs, MCP Hosts, Caches, Queues, RDBMS, NoSQL)            │
+│         (APIs, MCP Hosts, Caches, Queues, RDBMS, NoSQL)             │
 └──────────────────────────┬──────────────────────────────────────────┘
                            │  HTTP POST /api/signals  (rate-limited)
                            ▼
 ┌─────────────────────────────────────────────────────────────────────┐
-│                    INGESTION LAYER (FastAPI)                         │
-│  • Validates payload (Pydantic)                                      │
+│                    INGESTION LAYER (FastAPI)                        │
+│  • Validates payload (Pydantic)                                     │
 │  • Rate limiter: 6,000 req/min (slowapi)                            │
 │  • Pushes to Redis Stream — returns 202 immediately                 │
 └──────────────────────────┬──────────────────────────────────────────┘
                            │  xadd  (max 100k entries, ~LRU eviction)
                            ▼
 ┌─────────────────────────────────────────────────────────────────────┐
-│                    REDIS STREAMS  (Buffer)                           │
+│                    REDIS STREAMS  (Buffer)                          │
 │  • Absorbs 10,000+ signals/sec without blocking the HTTP layer      │
 │  • Consumer group ensures at-least-once delivery                    │
 │  • Acts as backpressure valve between ingestion & persistence       │
@@ -33,49 +33,49 @@
                            │  xreadgroup (batch=100, block=1s)
                            ▼
 ┌─────────────────────────────────────────────────────────────────────┐
-│                    PROCESSOR (Async Consumer)                        │
-│                                                                      │
-│  ┌─ Debounce Logic ────────────────────────────────────────────┐   │
-│  │  If Redis key "ims:debounce:<component_id>" exists:         │   │
-│  │    → link signal to existing WorkItem (no new row)          │   │
-│  │  Else:                                                       │   │
-│  │    → evaluate alert strategy → create WorkItem in Postgres  │   │
-│  │    → set Redis key with 10s TTL                             │   │
-│  └──────────────────────────────────────────────────────────────┘  │
-│                                                                      │
-│  ┌─ Write Paths ───────────────────────────────────────────────┐   │
-│  │  MongoDB  ← raw signal document (audit log)                 │   │
-│  │  Postgres ← WorkItem row (source of truth, transactional)   │   │
-│  │  Redis    ← dashboard cache hash per WorkItem               │   │
-│  └──────────────────────────────────────────────────────────────┘  │
+│                    PROCESSOR (Async Consumer)                       │
+│                                                                     │
+│  ┌─ Debounce Logic ────────────────────────────────────────────┐    │
+│  │  If Redis key "ims:debounce:<component_id>" exists:         │    │
+│  │    → link signal to existing WorkItem (no new row)          │    │
+│  │  Else:                                                      │    │
+│  │    → evaluate alert strategy → create WorkItem in Postgres  │    │
+│  │    → set Redis key with 10s TTL                             │    │
+│  └─────────────────────────────────────────────────────────────┘    │
+│                                                                     │
+│  ┌─ Write Paths ───────────────────────────────────────────────┐    │
+│  │  MongoDB  ← raw signal document (audit log)                 │    │
+│  │  Postgres ← WorkItem row (source of truth, transactional)   │    │
+│  │  Redis    ← dashboard cache hash per WorkItem               │    │
+│  └─────────────────────────────────────────────────────────────┘    │
 └─────────────────────────────────────────────────────────────────────┘
          │                     │                    │
          ▼                     ▼                    ▼
-  ┌────────────┐       ┌─────────────┐      ┌────────────────┐
+  ┌────────────┐       ┌─────────────┐       ┌────────────────┐
   │  MongoDB   │       │  PostgreSQL  │      │  Redis Cache   │
   │            │       │ +TimescaleDB │      │                │
   │ Raw signal │       │  WorkItems   │      │ Dashboard hash │
   │ audit log  │       │  RCA Records │      │ Debounce keys  │
   │ (NoSQL)    │       │  Timeseries  │      │ (Hot-path)     │
-  └────────────┘       └─────────────┘      └────────────────┘
+  └────────────┘       └─────────────┘       └────────────────┘
                                │
                                ▼
               ┌────────────────────────────────┐
-              │        REST API (FastAPI)        │
-              │  GET  /api/incidents             │
-              │  GET  /api/incidents/:id         │
-              │  GET  /api/incidents/:id/signals │
-              │  PATCH /api/incidents/:id/status │
-              │  POST  /api/incidents/:id/rca    │
-              │  GET  /health                    │
+              │        REST API (FastAPI)       │
+              │  GET  /api/incidents            │
+              │  GET  /api/incidents/:id        │
+              │  GET  /api/incidents/:id/signals│
+              │  PATCH /api/incidents/:id/status│
+              │  POST  /api/incidents/:id/rca   │
+              │  GET  /health                   │
               └────────────────┬───────────────┘
                                │
                                ▼
               ┌────────────────────────────────┐
-              │       React Frontend            │
-              │  Live Feed (5s poll)            │
-              │  Incident Detail + Signals      │
-              │  RCA Form                       │
+              │       React Frontend           │
+              │  Live Feed (5s poll)           │
+              │  Incident Detail + Signals     │
+              │  RCA Form                      │
               └────────────────────────────────┘
 ```
 
