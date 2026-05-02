@@ -1,13 +1,17 @@
 """
 REST API for work items (incidents) and RCA.
+
+Hot-path: GET /api/incidents reads from Redis cache first.
+Cold-path: Falls back to Postgres if cache is empty or stale.
 """
 import uuid
+import json
 import logging
 from datetime import datetime, timezone
 from typing import Optional
 
 from fastapi import APIRouter, Depends, HTTPException, Query
-from sqlalchemy import select, func
+from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from core.database import get_pg_session, get_mongo_db, get_redis
@@ -34,14 +38,76 @@ ROOT_CAUSE_CATEGORIES = [
 ]
 
 
+def _parse_cache_item(data: dict) -> dict:
+    """Convert Redis hash strings back to the right types."""
+    mttr = data.get("mttr_seconds", "")
+    return {
+        "id": data["id"],
+        "component_id": data["component_id"],
+        "severity": data["severity"],
+        "status": data["status"],
+        "title": data["title"],
+        "signal_count": int(data.get("signal_count", 1)),
+        "created_at": data.get("created_at", ""),
+        "updated_at": data.get("updated_at", data.get("created_at", "")),
+        "resolved_at": data.get("resolved_at") or None,
+        "closed_at": data.get("closed_at") or None,
+        "mttr_seconds": int(mttr) if mttr else None,
+    }
+
+
 @router.get("", response_model=list[WorkItemResponse])
 async def list_incidents(
     status: Optional[str] = Query(None),
     severity: Optional[str] = Query(None),
     limit: int = Query(50, le=200),
+    redis=Depends(get_redis),
     session: AsyncSession = Depends(get_pg_session),
 ):
-    q = select(WorkItem).order_by(WorkItem.severity, WorkItem.created_at.desc()).limit(limit)
+    """
+    Hot-path: reads from Redis sorted set + hashes.
+    Falls back to Postgres if cache is cold (e.g. fresh restart).
+    """
+    # ── Try Redis cache first ──────────────────────────────────────────────
+    try:
+        ids = await redis.zrange("ims:wi:index", 0, -1)  # sorted by severity
+        if ids:
+            pipe = redis.pipeline(transaction=False)
+            for wid in ids:
+                pipe.hgetall(f"ims:wi:{wid}")
+            results = await pipe.execute()
+
+            items = []
+            for data in results:
+                if not data:
+                    continue
+                try:
+                    parsed = _parse_cache_item(data)
+                    # Apply filters
+                    if status and parsed["status"] != status:
+                        continue
+                    if severity and parsed["severity"] != severity:
+                        continue
+                    items.append(parsed)
+                except Exception:
+                    continue  # skip malformed cache entry
+
+            if items:
+                # Sort: severity first (P0→P3), then newest first
+                SEV = {"P0": 0, "P1": 1, "P2": 2, "P3": 3}
+                items.sort(key=lambda x: (SEV.get(x["severity"], 9), x["created_at"]))
+                log.debug("Served %d incidents from Redis cache", len(items))
+                return items[:limit]
+    except Exception as exc:
+        log.warning("Redis cache read failed, falling back to Postgres: %s", exc)
+
+    # ── Cold path: Postgres ────────────────────────────────────────────────
+    log.info("Cache miss — querying Postgres for incidents")
+    q = (
+        select(WorkItem)
+        .order_by(WorkItem.severity, WorkItem.created_at.desc())
+        .limit(limit)
+    )
     if status:
         q = q.where(WorkItem.status == status)
     if severity:
@@ -67,7 +133,7 @@ async def get_incident_signals(
     limit: int = Query(100, le=500),
     mongo_db=Depends(get_mongo_db),
 ):
-    """Raw signals from MongoDB (the audit log)."""
+    """Raw signals from MongoDB — the audit log."""
     cursor = (
         mongo_db.signals
         .find({"work_item_id": str(incident_id)}, {"_id": 0})
@@ -95,7 +161,7 @@ async def update_status(
     except ValueError as exc:
         raise HTTPException(400, str(exc))
 
-    # CLOSED requires an RCA
+    # CLOSED requires a completed RCA
     if body.status == "CLOSED":
         rca = await session.execute(
             select(RCARecord).where(RCARecord.work_item_id == incident_id)
@@ -106,7 +172,7 @@ async def update_status(
                 "Cannot close incident without a completed RCA. Submit RCA first.",
             )
 
-    # Apply state entry hooks
+    # Apply state entry hooks (sets resolved_at, closed_at, mttr_seconds)
     state = get_state(body.status)
     item_dict = {
         "created_at": item.created_at,
@@ -124,9 +190,14 @@ async def update_status(
     await session.commit()
     await session.refresh(item)
 
-    # Invalidate / update cache
+    # ── Invalidate / update Redis cache ───────────────────────────────────
     cache_key = f"ims:wi:{incident_id}"
-    await redis.hset(cache_key, mapping={"status": item.status})
+    await redis.hset(cache_key, mapping={
+        "status": item.status,
+        "resolved_at": item.resolved_at.isoformat() if item.resolved_at else "",
+        "closed_at": item.closed_at.isoformat() if item.closed_at else "",
+        "mttr_seconds": str(item.mttr_seconds or ""),
+    })
 
     return item
 
@@ -141,9 +212,11 @@ async def submit_rca(
     if not item:
         raise HTTPException(404, "Incident not found")
     if item.status not in ("INVESTIGATING", "RESOLVED"):
-        raise HTTPException(400, "RCA can only be submitted for INVESTIGATING or RESOLVED incidents")
+        raise HTTPException(
+            400, "RCA can only be submitted for INVESTIGATING or RESOLVED incidents"
+        )
 
-    # Idempotency: reject duplicate RCA
+    # Idempotency guard
     existing = await session.execute(
         select(RCARecord).where(RCARecord.work_item_id == incident_id)
     )
